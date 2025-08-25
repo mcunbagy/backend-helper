@@ -5,24 +5,22 @@ import cors from "cors";
 import multer from "multer";
 import fetch from "node-fetch";
 import { v4 as uuidv4 } from "uuid";
-import FormData from "form-data";
 
 // ——— ENV ———
 const {
-  RUNPOD_MODE = "proxy",               // "serverless" | "proxy"
-  RUNPOD_ENDPOINT_ID = "",             // serverless ise zorunlu
-  RUNPOD_TOKEN = "",                   // serverless ise zorunlu
-  RUNPOD_PROXY_BASE = "",              // proxy ise zorunlu, ör: https://<pod>-3000.proxy.runpod.net
+  RUNPOD_MODE = "proxy",                 // "serverless" | "proxy"
+  RUNPOD_ENDPOINT_ID = "",               // serverless ise zorunlu
+  RUNPOD_TOKEN = "",                     // serverless ise zorunlu
+  RUNPOD_PROXY_BASE = "",                // proxy ise zorunlu, ör: https://<pod>-3000.proxy.runpod.net
   RUNPOD_PROXY_RUN_PATH = "/run",
   RUNPOD_PROXY_STATUS_PATH = "/status",
-  RUNPOD_PROXY_UPLOAD_PATH = "/upload",// bridge.py'deki upload route
 
   PORT = 3000,
   CORS_ORIGINS = "",
   HELPER_APP_TOKEN = "",
 } = process.env;
 
-// Modlara göre doğrulama
+// Modlara göre basit doğrulama
 if (RUNPOD_MODE === "serverless") {
   if (!RUNPOD_ENDPOINT_ID || !RUNPOD_TOKEN) {
     console.error("[FATAL] serverless mode needs RUNPOD_ENDPOINT_ID + RUNPOD_TOKEN");
@@ -46,10 +44,6 @@ const RUNPOD_RUN = RUNPOD_MODE === "proxy"
 const RUNPOD_STATUS = RUNPOD_MODE === "proxy"
   ? `${RUNPOD_PROXY_BASE}${RUNPOD_PROXY_STATUS_PATH}`
   : `https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/status`;
-
-const RUNPOD_UPLOAD = RUNPOD_MODE === "proxy"
-  ? `${RUNPOD_PROXY_BASE}${RUNPOD_PROXY_UPLOAD_PATH}`
-  : null; // serverless modda kullanılmıyor
 
 // ——— App ———
 const app = express();
@@ -79,7 +73,7 @@ app.use((req, res, next) => {
 // Upload (form-data) – memory
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 },
+  limits: { fileSize: 15 * 1024 * 1024 },
 });
 
 // ——— In‑Memory Job Store + Queues ———
@@ -96,47 +90,22 @@ function nextJob() {
   return premiumQ.shift() || basicQ.shift() || null;
 }
 
-// ——— Helpers ———
-function pickFile(files, ...names) {
-  return (files || []).find(f => names.includes(f.field));
+// ——— Helper: proxy’ye dosya yükle (yerleşik FormData/Blob ile) ———
+async function uploadToProxyAsFilename(proxyBase, fieldName, buf, filename, mime) {
+  const fd = new FormData(); // Node 18+ global
+  const blob = new Blob([buf], { type: mime || "application/octet-stream" });
+  fd.append("file", blob, filename);    // backend /upload 'file' alanını bekliyor
+  // Content-Type başlığını ELLE ekleme; boundary’yi fetch kendi koyar.
+  const r = await fetch(`${proxyBase}/upload`, { method: "POST", body: fd });
+  const t = await r.text();
+  if (!r.ok) throw new Error(`proxy upload failed ${r.status} ${t}`);
+  const j = JSON.parse(t);
+  if (!j?.ok || !j?.filename) throw new Error(`proxy upload bad payload ${t}`);
+  return j.filename; // Comfy input klasörüne yazılmış nihai isim (örn. in_*.jpg)
 }
 
-/**
- * Proxy'ye dosya upload (bridge.py /upload, alan adı 'file' OLMALI)
- * Dönen: { ok, name, subfolder, type }
- */
-async function uploadToProxyAsFilename(fileObj) {
-  if (RUNPOD_MODE !== "proxy") {
-    throw new Error("uploadToProxyAsFilename only valid in proxy mode");
-  }
-  if (!RUNPOD_UPLOAD) throw new Error("RUNPOD_UPLOAD not configured");
-
-  const form = new FormData();
-  form.append(
-    "file",
-    Buffer.from(fileObj.buffer),
-    { filename: fileObj.name || "upload.jpg", contentType: fileObj.mime || "application/octet-stream" }
-  );
-
-  const rpRes = await fetch(RUNPOD_UPLOAD, {
-    method: "POST",
-    // DİKKAT: form-data kendi Content-Type + boundary'sini ayarlar.
-    headers: form.getHeaders(),
-    body: form
-  });
-
-  const txt = await rpRes.text();
-  let js = {};
-  try { js = JSON.parse(txt); } catch { /* no-op */ }
-
-  if (!rpRes.ok || js.ok === false) {
-    throw new Error(`proxy upload failed ${rpRes.status} ${txt}`);
-  }
-
-  const name = js.name;
-  const sub = js.subfolder || "";
-  const comfyFilename = sub ? `${sub}/${name}` : name; // Comfy LoadImage->image alanına bu yazılır
-  return comfyFilename;
+function pickFile(files, ...names) {
+  return (files || []).find(f => names.includes(f.field));
 }
 
 /**
@@ -144,8 +113,8 @@ async function uploadToProxyAsFilename(fileObj) {
  *  - workflow_path: /workspace/OUTFITZ/01-Workflows/API_AVATAR_WF.json
  *  - set_nodes:
  *      "63.text"        => prompt
- *      "12.image"       => selfie (Comfy'nin gördüğü dosya adı)
- *      "120.image_path" => sabit pose dosyası (bridge içerde upload'a çeviriyor)
+ *      "12.image"       => selfie (PROXY’ye upload edilip dosya adı verilir)
+ *      "120.image_path" => sabit pose dosyası
  *  - return_nodes: [71, 130]
  */
 async function buildRunpodBodyForAvatar(jobInput = {}) {
@@ -153,26 +122,28 @@ async function buildRunpodBodyForAvatar(jobInput = {}) {
   const selfie = pickFile(files, "selfie", "fullshot");
   if (!selfie) throw new Error("selfie/fullshot image required");
 
-  // 1) Selfie'yi proxy'ye upload et, comfy'nin göreceği dosya adını al
-  const comfySelfieName = await uploadToProxyAsFilename(selfie);
+  // 1) selfie’yi proxy’ye yükle -> Comfy input’a düşsün, bize dosya adı dönsün
+  const uploadedName = await uploadToProxyAsFilename(
+    RUNPOD_PROXY_BASE,
+    "file",
+    Buffer.from(selfie.base64, "base64"),
+    selfie.name || "selfie.jpg",
+    selfie.mime || "image/jpeg"
+  );
 
-  // 2) Prompt
   const prompt =
     jobInput.prompt ||
     jobInput.PROMPT_MAIN ||
     jobInput?.input?.prompt ||
     "";
 
-  // 3) Pose path (bridge bunu Comfy'ye /upload ile aktaracak)
-  const poseLocalPath = "/workspace/OUTFITZ/01-Workflows/pose-input.png";
-
   return {
     input: {
       workflow_path: "/workspace/OUTFITZ/01-Workflows/API_AVATAR_WF.json",
       set_nodes: {
         "63.text": String(prompt || ""),
-        "12.image": comfySelfieName,             // <-- doğrudan comfy dosya adı
-        "120.image_path": poseLocalPath          // <-- bridge upload edecek
+        "12.image": uploadedName, // Load Image node filename bekliyor
+        "120.image_path": "/workspace/OUTFITZ/01-Workflows/pose-input.png",
       },
       return_nodes: [71, 130],
     },
@@ -222,7 +193,7 @@ async function dispatchToRunpod(jobId) {
       throw new Error(`RunPod /run failed: ${rpRes.status} ${txt}`);
     }
 
-    const rpJson = await rpRes.json(); // proxy: { id } (bridge.py)
+    const rpJson = await rpRes.json(); // proxy: { id } döndürüyoruz bridge.py'de
     const remoteId = rpJson?.id || rpJson?.jobId || rpJson?.runId || null;
     if (!remoteId) {
       throw new Error("RunPod /run: missing remote job id");
@@ -263,14 +234,13 @@ app.get("/health", (_req, res) => res.json({ ok: true, up: true }));
 app.post("/jobs/start", upload.any(), async (req, res) => {
   try {
     const isForm = req.is("multipart/form-data");
-    const workflow = req.body?.workflow;
-    const priority = (req.body?.priority === "premium") ? "premium" : "basic";
+    const workflow = isForm ? req.body?.workflow : req.body?.workflow;
+    const priority = (isForm ? req.body?.priority : req.body?.priority) === "premium" ? "premium" : "basic";
 
     if (!workflow) {
       return res.status(400).json({ ok: false, error: "workflow required" });
     }
 
-    // input toparla
     let input;
     if (isForm) {
       const raw = req.body?.input;
@@ -279,12 +249,12 @@ app.post("/jobs/start", upload.any(), async (req, res) => {
       input = req.body?.input || {};
     }
 
-    // dosyaları input.files’e ekle
+    // dosyaları base64’e koyup input.files’e ekle
     const files = (req.files || []).map(f => ({
       field: f.fieldname,
       name: f.originalname,
       mime: f.mimetype,
-      buffer: f.buffer,     // <— artık buffer tutuyoruz (base64 değil)
+      base64: f.buffer.toString("base64"),
     }));
     if (files.length) input.files = files;
 
