@@ -13,6 +13,10 @@ const {
   PORT = 3000,
   CORS_ORIGINS = "",
   HELPER_APP_TOKEN = "",
+  RUNPOD_MODE = "serverless",
+  RUNPOD_PROXY_BASE = "",
+  RUNPOD_PROXY_RUN_PATH = "/run",
+  RUNPOD_PROXY_STATUS_PATH = "/status",
 } = process.env;
 
 if (!RUNPOD_ENDPOINT_ID || !RUNPOD_TOKEN) {
@@ -301,3 +305,4 @@ app.listen(PORT, () => {
   console.log(`[helper] listening on :${PORT}`);
   console.log(`[helper] runpod endpoint: ${RUNPOD_ENDPOINT_ID}`);
 });
+
