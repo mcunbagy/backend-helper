@@ -8,19 +8,19 @@ import { v4 as uuidv4 } from "uuid";
 
 // ——— ENV ———
 const {
-  RUNPOD_MODE = "proxy",            // "serverless" | "proxy"
-  RUNPOD_ENDPOINT_ID = "",               // serverless ise zorunlu
-  RUNPOD_TOKEN = "rpa_47M4C87LP8AR6SZ5BMWDQ3KJ9B8UHISRZDYL1I6Syj20sj",                     // serverless ise zorunlu
-  RUNPOD_PROXY_BASE = "https://vf3p6baogp4km7-3000.proxy.runpod.net",   // proxy ise zorunlu, ör: https://<pod>-3000.proxy.runpod.net
+  RUNPOD_MODE = "proxy",                 // "serverless" | "proxy"
+  RUNPOD_ENDPOINT_ID = "",              // serverless ise zorunlu
+  RUNPOD_TOKEN = "",                    // serverless ise zorunlu
+  RUNPOD_PROXY_BASE = "",               // proxy ise zorunlu, ör: https://<pod>-3000.proxy.runpod.net
   RUNPOD_PROXY_RUN_PATH = "/run",
   RUNPOD_PROXY_STATUS_PATH = "/status",
 
   PORT = 3000,
   CORS_ORIGINS = "http://localhost:19006,https://outfitz.aigence.net",
-  HELPER_APP_TOKEN = "09449104fc0b5573747d673a94dc2b273c8b0e6f64fb2177064025e98b89eec3",
+  HELPER_APP_TOKEN = "",
 } = process.env;
 
-// Modlara göre basit doğrulama
+// Modlara göre doğrulama
 if (RUNPOD_MODE === "serverless") {
   if (!RUNPOD_ENDPOINT_ID || !RUNPOD_TOKEN) {
     console.error("[FATAL] serverless mode needs RUNPOD_ENDPOINT_ID + RUNPOD_TOKEN");
@@ -90,18 +90,53 @@ function nextJob() {
   return premiumQ.shift() || basicQ.shift() || null;
 }
 
-// ——— Helpers (API_AVATAR_WF body) ———
+// ——— Helpers ———
 function pickFile(files, ...names) {
   return (files || []).find(f => names.includes(f.field));
+}
+
+// Proxy upload helper: selfie dosyasını bridge'e gönderip filename al
+async function uploadToProxyAsFilename(fileObj) {
+  // fileObj: { field, name, mime, base64 }
+  const url = `${RUNPOD_PROXY_BASE}/upload`;
+  const boundary = "----helperform" + Math.random().toString(16).slice(2);
+  const bodyChunks = [];
+
+  const push = (chunk) => bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+
+  // multipart başlık
+  push(`--${boundary}\r\n`);
+  push(`Content-Disposition: form-data; name="image"; filename="${fileObj.name || "selfie.jpg"}"\r\n`);
+  push(`Content-Type: ${fileObj.mime || "application/octet-stream"}\r\n\r\n`);
+  // dosya içeriği
+  push(Buffer.from(fileObj.base64, "base64"));
+  push(`\r\n--${boundary}--\r\n`);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": `multipart/form-data; boundary=${boundary}`,
+    },
+    body: Buffer.concat(bodyChunks),
+  });
+
+  let txt = await res.text();
+  let json;
+  try { json = JSON.parse(txt); } catch { json = null; }
+
+  if (!res.ok || !json?.ok || !json?.filename) {
+    throw new Error(`proxy upload failed ${res.status} ${txt}`);
+  }
+  return json.filename; // ComfyUI Load Image'da gözükmesi gereken "filename"
 }
 
 /**
  * Avatar sözleşmesi:
  *  - workflow_path: /workspace/OUTFITZ/01-Workflows/API_AVATAR_WF.json
  *  - set_nodes:
- *      "63.text"          => prompt
- *      "12.image_base64"  => selfie (data URL)
- *      "120.image_path"   => sabit pose dosyası
+ *      "63.text"         => prompt
+ *      "12.image"        => (proxy: filename) | (serverless: data URL)
+ *      "120.image_path"  => pose sabit path
  *  - return_nodes: [71, 130]
  */
 async function buildRunpodBodyForAvatar(jobInput = {}) {
@@ -115,12 +150,25 @@ async function buildRunpodBodyForAvatar(jobInput = {}) {
     jobInput?.input?.prompt ||
     "";
 
+  // Proxy: önce dosyayı /upload'a at → filename döner → 12.image
+  // Serverless: eski image_base64 yolu (geri uyumluluk)
+  let selfieSetterKey = "12.image";
+  let selfieSetterVal;
+
+  if (RUNPOD_MODE === "proxy") {
+    const filename = await uploadToProxyAsFilename(selfie);
+    selfieSetterVal = filename; // Load Image node filename
+  } else {
+    selfieSetterKey = "12.image_base64";
+    selfieSetterVal = `data:${selfie.mime};base64,${selfie.base64}`;
+  }
+
   return {
     input: {
       workflow_path: "/workspace/OUTFITZ/01-Workflows/API_AVATAR_WF.json",
       set_nodes: {
         "63.text": String(prompt || ""),
-        "12.image_base64": `data:${selfie.mime};base64,${selfie.base64}`,
+        [selfieSetterKey]: selfieSetterVal,
         "120.image_path": "/workspace/OUTFITZ/01-Workflows/pose-input.png",
       },
       return_nodes: [71, 130],
@@ -171,7 +219,7 @@ async function dispatchToRunpod(jobId) {
       throw new Error(`RunPod /run failed: ${rpRes.status} ${txt}`);
     }
 
-    const rpJson = await rpRes.json(); // serverless: { id }, proxy: { id|jobId|runId } olabilir
+    const rpJson = await rpRes.json(); // serverless: { id }, proxy: { id|jobId|runId }
     const remoteId = rpJson?.id || rpJson?.jobId || rpJson?.runId || null;
     if (!remoteId) {
       throw new Error("RunPod /run: missing remote job id");
