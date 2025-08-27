@@ -87,7 +87,7 @@ const logger = winston.createLogger({
 
 // ===================== DATABASE SETUP =====================
 const dynamoClient = new DynamoDBClient({
-  region: AWS_REGION,
+  region: AWS_REGION || "us-east-1",
   credentials: {
     accessKeyId: AWS_ACCESS_KEY_ID,
     secretAccessKey: AWS_SECRET_ACCESS_KEY,
@@ -95,7 +95,7 @@ const dynamoClient = new DynamoDBClient({
 });
 
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
-const TABLE_NAME = DYNAMODB_TABLE_NAME;
+const TABLE_NAME = DYNAMODB_TABLE_NAME || "outfitz-jobs";
 
 // Database helper functions
 const db = {
