@@ -7,12 +7,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js",
-    "build": "prisma generate",
-    "db:migrate": "prisma migrate dev",
-    "db:deploy": "prisma migrate deploy",
-    "db:seed": "node prisma/seed.js",
-    "db:studio": "prisma studio"
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.400.0",
