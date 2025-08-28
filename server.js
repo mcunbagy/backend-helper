@@ -863,3 +863,119 @@ app.get('/api/jobs/:jobId/result', authenticateToken, async (req, res) => {
     let response = { 
       ready: true, 
       workflow: job.workflow,
+      raw: result
+    };
+
+    // Workflow-specific result formatting
+    if (job.workflow === 'API_AVATAR_WF') {
+      const outputPerNode = result.outputPerNode || {};
+      
+      response.avatarUrl = outputPerNode['132']?.[0]?.url || null;
+      response.avatarNoBgUrl = outputPerNode['133']?.[0]?.url || null;
+      
+      if (!response.avatarUrl || !response.avatarNoBgUrl) {
+        const extractUrl = (nodeId) => {
+          return outputPerNode[nodeId]?.[0]?.url || 
+                 outputPerNode[String(nodeId)]?.[0]?.url || 
+                 null;
+        };
+        
+        response.avatarUrl = response.avatarUrl || extractUrl(132);
+        response.avatarNoBgUrl = response.avatarNoBgUrl || extractUrl(133);
+      }
+    } else if (job.workflow === 'API_V7_ULTIMATE_WF' || job.workflow === 'API_CREATE_CLTH') {
+      // Add specific result formatting for other workflows as needed
+      const outputPerNode = result.outputPerNode || {};
+      response.resultUrls = [];
+      
+      Object.keys(outputPerNode).forEach(nodeId => {
+        if (outputPerNode[nodeId] && outputPerNode[nodeId].length > 0) {
+          response.resultUrls.push(...outputPerNode[nodeId].map(item => item.url).filter(Boolean));
+        }
+      });
+    }
+
+    res.json(response);
+
+  } catch (error) {
+    logger.error('Job result fetch failed:', error);
+    res.status(500).json({ error: 'Failed to fetch job result' });
+  }
+});
+
+// List user jobs
+app.get('/api/jobs', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { limit = 20 } = req.query;
+    
+    const result = await db.getUserJobs(userId, parseInt(limit));
+
+    res.json({
+      jobs: result.jobs.map(job => ({
+        jobId: job.jobId,
+        workflow: job.workflow,
+        status: job.status,
+        priority: job.priority,
+        createdAt: job.createdAt,
+        completedAt: job.completedAt,
+        error: job.error,
+      })),
+      hasMore: !!result.lastKey
+    });
+
+  } catch (error) {
+    logger.error('Jobs list fetch failed:', error);
+    res.status(500).json({ error: 'Failed to fetch jobs' });
+  }
+});
+
+// Error handling
+app.use((error, req, res, next) => {
+  logger.error('Unhandled error:', error);
+  
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File too large (max 15MB)' });
+    }
+    if (error.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({ error: 'Too many files (max 5)' });
+    }
+  }
+  
+  res.status(500).json({ 
+    error: 'Internal server error',
+    details: NODE_ENV === 'development' ? error.message : undefined
+  });
+});
+
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, shutting down gracefully...');
+  
+  try {
+    await worker.close();
+    await redis.quit();
+    process.exit(0);
+  } catch (error) {
+    logger.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+});
+
+// Start server
+const server = app.listen(PORT, () => {
+  logger.info(`Server running on port ${PORT}`, {
+    environment: NODE_ENV,
+    queueConcurrency: QUEUE_CONCURRENCY,
+    runpodBase: RUNPOD_PROXY_BASE,
+    dynamoTable: TABLE_NAME,
+    supportedWorkflows: Object.keys(workflowHandlers)
+  });
+});
+
+export default app;
