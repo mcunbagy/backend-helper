@@ -1,0 +1,998 @@
+// server.js - DynamoDB Version for Production (Flexible Workflow System)
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import { createClient } from "redis";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { Queue, Worker, QueueEvents } from "bullmq";
+import jwt from "jsonwebtoken";
+import multer from "multer";
+import fetch from "node-fetch";
+import { v4 as uuidv4 } from "uuid";
+import winston from "winston";
+import { promisify } from "util";
+
+// ===================== CONFIGURATION =====================
+const {
+  NODE_ENV = "production",
+  PORT = 3000,
+  
+  // AWS Configuration
+  AWS_REGION,
+  AWS_ACCESS_KEY_ID,
+  AWS_SECRET_ACCESS_KEY,
+  DYNAMODB_TABLE_NAME,
+  
+  // Redis Configuration
+  REDIS_URL,
+  JWT_SECRET,
+  
+  // RunPod Configuration
+  RUNPOD_MODE = "proxy",
+  RUNPOD_ENDPOINT_ID,
+  RUNPOD_TOKEN, 
+  RUNPOD_PROXY_BASE,
+  RUNPOD_PROXY_RUN_PATH = "/run",
+  RUNPOD_PROXY_STATUS_PATH = "/status",
+  RUNPOD_PROXY_TOKEN,
+  
+  // Rate Limiting
+  RATE_LIMIT_WINDOW_MS = "900000",
+  RATE_LIMIT_MAX = "100",
+  
+  // Queue Configuration
+  QUEUE_CONCURRENCY = "50",
+  QUEUE_MAX_RETRIES = "3",
+  
+  // Security
+  CORS_ORIGINS = "",
+  TRUSTED_PROXIES = "1",
+  
+} = process.env;
+
+// Validation
+if (!AWS_REGION || !AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY || !DYNAMODB_TABLE_NAME) {
+  console.error("[FATAL] AWS credentials and table name are required");
+  process.exit(1);
+}
+if (!REDIS_URL) {
+  console.error("[FATAL] REDIS_URL is required");
+  process.exit(1);
+}
+if (!JWT_SECRET) {
+  console.error("[FATAL] JWT_SECRET is required");
+  process.exit(1);
+}
+if (RUNPOD_MODE === "proxy" && !RUNPOD_PROXY_BASE) {
+  console.error("[FATAL] RUNPOD_PROXY_BASE is required for proxy mode");
+  process.exit(1);
+}
+
+// RunPod auth header (for protected bridge.py)
+const runpodAuthHeaders = RUNPOD_PROXY_TOKEN ? { 'x-helper-token': RUNPOD_PROXY_TOKEN } : {};
+
+// ===================== LOGGING =====================
+const logger = winston.createLogger({
+  level: NODE_ENV === "production" ? "info" : "debug",
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.simple()
+    })
+  ]
+});
+
+// ===================== DATABASE SETUP =====================
+const dynamoClient = new DynamoDBClient({
+  region: AWS_REGION || "us-east-1",
+  credentials: {
+    accessKeyId: AWS_ACCESS_KEY_ID,
+    secretAccessKey: AWS_SECRET_ACCESS_KEY,
+  },
+});
+
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
+const TABLE_NAME = DYNAMODB_TABLE_NAME || "outfitz-jobs";
+
+// Database helper functions - Fixed for PK/SK structure
+const db = {
+  async createJob(jobData) {
+    const timestamp = new Date().toISOString();
+    const params = {
+      TableName: TABLE_NAME,
+      Item: {
+        PK: `USER#${jobData.userId}`,
+        SK: `JOB#${timestamp}#${jobData.id}`,
+        // Store all job data as attributes
+        jobId: jobData.id,
+        userId: jobData.userId,
+        workflow: jobData.workflow,
+        status: jobData.status,
+        priority: jobData.priority,
+        input: jobData.input,
+        createdAt: timestamp,
+      }
+    };
+    await docClient.send(new PutCommand(params));
+    return jobData;
+  },
+
+  async getJob(jobId, userId = null) {
+    // Since we can't directly query by jobId with this structure,
+    // we need to query all user jobs and find the specific one
+    if (!userId) {
+      throw new Error('userId is required to get job with current table structure');
+    }
+
+    const params = {
+      TableName: TABLE_NAME,
+      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)',
+      ExpressionAttributeValues: {
+        ':pk': `USER#${userId}`,
+        ':sk': 'JOB#'
+      }
+    };
+    
+    const result = await docClient.send(new QueryCommand(params));
+    const job = result.Items?.find(item => item.jobId === jobId);
+    
+    return job || null;
+  },
+
+  async updateJobWithUser(jobId, userId, updates) {
+    // First find the job to get its SK
+    const job = await this.getJob(jobId, userId);
+    if (!job) {
+      throw new Error('Job not found');
+    }
+
+    const updateExpression = [];
+    const expressionAttributeNames = {};
+    const expressionAttributeValues = {};
+    
+    Object.keys(updates).forEach((key, index) => {
+      const attrName = `#attr${index}`;
+      const attrValue = `:val${index}`;
+      
+      updateExpression.push(`${attrName} = ${attrValue}`);
+      expressionAttributeNames[attrName] = key;
+      expressionAttributeValues[attrValue] = updates[key];
+    });
+
+    const params = {
+      TableName: TABLE_NAME,
+      Key: {
+        PK: job.PK,
+        SK: job.SK
+      },
+      UpdateExpression: `SET ${updateExpression.join(', ')}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+    };
+
+    await docClient.send(new UpdateCommand(params));
+  },
+
+  async getUserJobs(userId, limit = 20, lastKey = null) {
+    const params = {
+      TableName: TABLE_NAME,
+      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)',
+      ExpressionAttributeValues: {
+        ':pk': `USER#${userId}`,
+        ':sk': 'JOB#'
+      },
+      ScanIndexForward: false, // Sort by SK descending (newest first)
+      Limit: limit
+    };
+
+    if (lastKey) {
+      params.ExclusiveStartKey = lastKey;
+    }
+
+    const result = await docClient.send(new QueryCommand(params));
+    return {
+      jobs: result.Items || [],
+      lastKey: result.LastEvaluatedKey
+    };
+  },
+
+  async createUser(userData) {
+    const params = {
+      TableName: TABLE_NAME,
+      Item: {
+        PK: `USER#${userData.id}`,
+        SK: 'PROFILE',
+        userId: userData.id,
+        ...userData,
+        createdAt: new Date().toISOString(),
+      }
+    };
+    await docClient.send(new PutCommand(params));
+    return userData;
+  },
+
+  async getUser(userId) {
+    const params = {
+      TableName: TABLE_NAME,
+      Key: {
+        PK: `USER#${userId}`,
+        SK: 'PROFILE'
+      }
+    };
+    
+    const result = await docClient.send(new GetCommand(params));
+    return result.Item || null;
+  }
+};
+
+// ===================== REDIS & QUEUE =====================
+const redis = createClient({
+  url: REDIS_URL,
+  socket: {
+    connectTimeout: 60000,
+    commandTimeout: 5000,
+  },
+  retry_strategy: (times) => Math.min(times * 50, 2000)
+});
+
+redis.on('error', (err) => logger.error('Redis Client Error', err));
+redis.on('connect', () => logger.info('Redis Client Connected'));
+
+await redis.connect();
+
+// Job Queue Setup
+const jobQueue = new Queue('runpod-jobs', {
+  connection: redis,
+  defaultJobOptions: {
+    attempts: parseInt(QUEUE_MAX_RETRIES),
+    backoff: {
+      type: 'exponential',
+      delay: 2000,
+    },
+    removeOnComplete: 100,
+    removeOnFail: 50,
+  },
+});
+
+const queueEvents = new QueueEvents('runpod-jobs', { connection: redis });
+
+// Queue event handlers
+queueEvents.on('completed', async ({ jobId, returnvalue }) => {
+  logger.info(`Job ${jobId} completed`);
+  try {
+    const qJob = await jobQueue.getJob(jobId); // << fetch job
+    const userId = qJob?.data?.userId;
+    if (userId) {
+      await db.updateJobWithUser(jobId, userId, {
+        status: 'COMPLETED',
+        result: returnvalue,
+        completedAt: new Date().toISOString(),
+      });
+    } else {
+      logger.error(`No userId found for completed job ${jobId}`);
+    }
+  } catch (error) {
+    logger.error(`Failed to update completed job ${jobId}:`, error);
+  }
+});
+
+queueEvents.on('failed', async ({ jobId, failedReason }) => {
+  logger.error(`Job ${jobId} failed:`, failedReason);
+  try {
+    const qJob = await jobQueue.getJob(jobId); // << fetch job
+    const userId = qJob?.data?.userId;
+    if (userId) {
+      await db.updateJobWithUser(jobId, userId, {
+        status: 'FAILED',
+        error: failedReason,
+        completedAt: new Date().toISOString(),
+      });
+    } else {
+      logger.error(`No userId found for failed job ${jobId}`);
+    }
+  } catch (error) {
+    logger.error(`Failed to update failed job ${jobId}:`, error);
+  }
+});
+
+// ===================== WORKFLOW SYSTEM =====================
+
+// Workflow Registry - Handles all workflow types with flexible input sources
+const workflowHandlers = {
+  "API_AVATAR_WF": {
+    outputNodes: ["132", "133"],
+    process: async (input, userData) => {
+      // Determine gender-based pose
+      const gender = userData?.gender || input.gender || "male";
+      const poseFile = gender === "female" 
+        ? "/workspace/pose-input-woman.png" 
+        : "/workspace/pose-input-man.png";
+
+      // Handle selfie image source
+      let selfieImagePath = "/workspace/memoSelf.jpg"; // Default
+      
+      if (input.files && input.files.length > 0) {
+        // User uploaded a file
+        const selfieFile = input.files.find(f => ['selfie', 'avatar', 'photo'].includes(f.field));
+        if (selfieFile) {
+          selfieImagePath = `/workspace/comfy/ComfyUI/input/${await uploadFileToRunpod(selfieFile)}`;
+        }
+      } else if (input.selfieImagePath) {
+        // Pre-existing path provided
+        selfieImagePath = input.selfieImagePath;
+      }
+
+      return {
+        workflow_path: "/workspace/OUTFITZ/01-Workflows/API_AVATAR_WF.json",
+        set_nodes: {
+          "12.image_path": selfieImagePath,
+          "120.image_path": poseFile,
+          "63.text": input.prompt || userData?.stylePrompt || "Full-body portrait, professional lighting",
+          "72.text": "close-up, close shot, close up shot, (worst quality, low quality, normal quality, lowres, low details, oversaturated, undersaturated, overexposed, underexposed, grayscale, bw, bad photo, bad photography, bad art:1.4), (watermark, signature, text font, username, error, logo, words, letters, digits, autograph, trademark, name:1.2), (blur, blurry, grainy), morbid, ugly, asymmetrical, mutated malformed, mutilated, poorly lit, bad shadow, draft, cropped, out of frame, cut off, censored, jpeg artifacts, out of focus, glitch, duplicate, (airbrushed, cartoon, anime, semi-realistic, cgi, render, blender, digital art, manga, amateur:1.3), (3D ,3D Game, 3D Game Scene, 3D Character:1.1), (bad hands, bad anatomy, bad body, bad face, bad teeth, bad arms, bad legs, deformities:1.3), anime, cartoon, graphic, (blur, blurry, bokeh), text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured"
+        }
+      };
+    }
+  },
+
+  "API_V7_ULTIMATE_WF": {
+    outputNodes: ["132", "133"], // Adjust based on your workflow
+    process: async (input, userData) => {
+      const itemType = input.itemType; // "top", "bottom", or "full"
+      
+      let setNodes = {};
+      let disabledNodes = [];
+
+      // Conditional node activation based on item type
+      if (itemType === "top") {
+        setNodes = {
+          // Top-specific nodes - adjust node IDs based on your workflow
+          "10.text": input.prompt || "fashionable top, high quality",
+          "15.image_path": await handleImageInput(input, "garment", userData),
+          // Add other top-specific node configurations
+        };
+        // Disable bottom-related nodes
+        disabledNodes = ["bottom_node_1", "bottom_node_2"]; // Replace with actual node IDs
+      } else if (itemType === "bottom") {
+        setNodes = {
+          // Bottom-specific nodes
+          "20.text": input.prompt || "stylish bottom wear, high quality",
+          "25.image_path": await handleImageInput(input, "garment", userData),
+          // Add other bottom-specific node configurations
+        };
+        // Disable top-related nodes
+        disabledNodes = ["top_node_1", "top_node_2"]; // Replace with actual node IDs
+      } else if (itemType === "full") {
+        // Full outfit workflow
+        setNodes = {
+          "30.text": input.prompt || "complete outfit, fashionable, high quality",
+          "35.image_path": await handleImageInput(input, "outfit", userData),
+        };
+        // All nodes active for full outfit
+        disabledNodes = [];
+      }
+
+      return {
+        workflow_path: "/workspace/OUTFITZ/01-Workflows/API_V7_ULTIMATE_WF.json",
+        set_nodes: setNodes,
+        disabled_nodes: disabledNodes // Bridge.py will need to handle this
+      };
+    }
+  },
+
+  "API_CREATE_CLTH": {
+    outputNodes: ["132", "133"], // Adjust based on your workflow
+    process: async (input, userData) => {
+      return {
+        workflow_path: "/workspace/OUTFITZ/01-Workflows/API_CREATE_CLTH.json",
+        set_nodes: {
+          // Define based on your workflow requirements
+          "40.text": input.prompt || "create clothing design, high quality",
+          "45.image_path": await handleImageInput(input, "design", userData),
+          // Add other nodes as needed
+        }
+      };
+    }
+  }
+};
+
+// Helper function to handle different image input sources
+async function handleImageInput(input, imageType, userData) {
+  // Priority order: uploaded file > AWS reference > RunPod existing > default
+  
+  // 1. Check for uploaded file
+  if (input.files && input.files.length > 0) {
+    const targetFile = input.files.find(f => f.field === imageType);
+    if (targetFile) {
+      return `/workspace/comfy/ComfyUI/input/${await uploadFileToRunpod(targetFile)}`;
+    }
+  }
+
+  // 2. Check for AWS reference (implement when needed)
+  if (input.awsImageKeys && input.awsImageKeys[imageType]) {
+    // TODO: Download from S3 and upload to RunPod
+    // return await downloadAndUploadFromAWS(input.awsImageKeys[imageType]);
+  }
+
+  // 3. Check for direct path reference
+  if (input.imagePaths && input.imagePaths[imageType]) {
+    return input.imagePaths[imageType];
+  }
+
+  // 4. Use default based on image type
+  const defaults = {
+    "selfie": "/workspace/memoSelf.jpg",
+    "pose": "/workspace/pose-input-man.png",
+    "garment": "/workspace/default-garment.jpg",
+    "outfit": "/workspace/default-outfit.jpg",
+    "design": "/workspace/default-design.jpg"
+  };
+
+  return defaults[imageType] || "/workspace/default-image.jpg";
+}
+
+// Main workflow processor
+async function buildRunpodPayload(input, userId) {
+  const { workflow } = input;
+
+  // Get workflow handler
+  const handler = workflowHandlers[workflow];
+  if (!handler) {
+    throw new Error(`Unknown workflow: ${workflow}`);
+  }
+
+  // Get user data for context
+  const userData = userId ? await db.getUser(userId) : {};
+
+  // Process workflow-specific configuration
+  const workflowConfig = await handler.process(input, userData);
+
+  return {
+    input: {
+      ...workflowConfig,
+      completion_nodes: handler.outputNodes,
+      complete_when_any: false
+    }
+  };
+}
+
+// File upload function (unchanged but moved here for organization)
+async function uploadFileToRunpod(file) {
+  const formData = new FormData();
+  const buffer = Buffer.from(file.base64, 'base64');
+  const blob = new Blob([buffer], { type: file.mime });
+  
+  formData.append('file', blob, file.name);
+
+  const response = await fetch(`${RUNPOD_PROXY_BASE}/upload`, {
+    method: 'POST',
+    body: formData,
+    headers: runpodAuthHeaders,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`File upload failed: ${response.status} - ${errorText}`);
+  }
+
+  const result = await response.json();
+  return result.filename;
+}
+
+async function pollRunpodForCompletion(runpodJobId, maxAttempts = 180) {
+  const delay = promisify(setTimeout);
+  
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(`${RUNPOD_PROXY_BASE}${RUNPOD_PROXY_STATUS_PATH}/${runpodJobId}`, {
+        headers: runpodAuthHeaders
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Status check failed: ${response.status}`);
+      }
+
+      const status = await response.json();
+      
+      logger.debug(`Job ${runpodJobId} status check ${attempt}: ${status.status}`);
+
+      if (status.status === 'COMPLETED') {
+        return status.output || status;
+      }
+      
+      if (status.status === 'FAILED') {
+        throw new Error(`RunPod job failed: ${JSON.stringify(status.error || status)}`);
+      }
+
+      const waitTime = Math.min(2000 + (attempt * 100), 5000);
+      await delay(waitTime);
+      
+    } catch (error) {
+      logger.error(`Status check attempt ${attempt} failed:`, error);
+      
+      if (attempt === maxAttempts) {
+        throw new Error(`Job polling failed after ${maxAttempts} attempts: ${error.message}`);
+      }
+      
+      await delay(5000);
+    }
+  }
+  
+  throw new Error(`Job did not complete within timeout (${maxAttempts} attempts)`);
+}
+
+// Worker
+const worker = new Worker('runpod-jobs', async (job) => {
+  const { jobId, userId, input } = job.data;
+  
+  logger.info(`Processing job ${jobId} for user ${userId} with workflow ${input.workflow}`);
+  
+  try {
+    await db.updateJobWithUser(jobId, userId, { 
+      status: 'PROCESSING',
+      processingStartedAt: new Date().toISOString()
+    });
+
+    const runpodBody = await buildRunpodPayload(input, userId);
+    
+    logger.info(`Submitting to RunPod: ${JSON.stringify(runpodBody)}`);
+    
+    const response = await fetch(`${RUNPOD_PROXY_BASE}${RUNPOD_PROXY_RUN_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...runpodAuthHeaders },
+      body: JSON.stringify(runpodBody),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`RunPod submission failed: ${response.status} - ${errorText}`);
+    }
+
+    const runpodResult = await response.json();
+    const runpodJobId = runpodResult.id;
+
+    if (!runpodJobId) {
+      throw new Error('RunPod did not return job ID');
+    }
+
+    logger.info(`RunPod job submitted with ID: ${runpodJobId}`);
+
+    await db.updateJobWithUser(jobId, userId, { 
+      runpodJobId,
+      status: 'SUBMITTED_TO_RUNPOD'
+    });
+
+    const result = await pollRunpodForCompletion(runpodJobId);
+    
+    logger.info(`Job ${jobId} completed successfully`);
+    return result;
+
+  } catch (error) {
+    logger.error(`Job ${jobId} processing failed:`, error);
+    throw error;
+  }
+}, {
+  connection: redis,
+  concurrency: parseInt(QUEUE_CONCURRENCY),
+});
+
+// ===================== EXPRESS APP =====================
+const app = express();
+
+app.set('trust proxy', parseInt(TRUSTED_PROXIES));
+app.use(helmet());
+
+const allowedOrigins = CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
+
+const limiter = rateLimit({
+  windowMs: parseInt(RATE_LIMIT_WINDOW_MS),
+  max: parseInt(RATE_LIMIT_MAX),
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/', limiter);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+app.use((req, res, next) => {
+  logger.info(`${req.method} ${req.path}`, {
+    ip: req.ip,
+    userAgent: req.get('User-Agent'),
+  });
+  next();
+});
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024, files: 5 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'), false);
+    }
+  },
+});
+
+// ===================== AUTH MIDDLEWARE =====================
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid token' });
+    }
+    req.user = user;
+    next();
+  });
+}
+
+const userLimiter = rateLimit({
+  windowMs: parseInt(RATE_LIMIT_WINDOW_MS),
+  max: parseInt(RATE_LIMIT_MAX),
+  keyGenerator: (req) => req.user?.id || req.ip,
+  message: { error: 'Too many requests from this user, please try again later.' },
+});
+
+// ===================== ROUTES =====================
+
+//PING
+app.get('/debug/runpod/ping', async (req, res) => {
+  try {
+    const r = await fetch(`${RUNPOD_PROXY_BASE}/health`, { headers: runpodAuthHeaders });
+    const text = await r.text();
+    res.status(r.status).send(text);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- SIMPLE, FAST HEALTHS ---
+const withTimeout = (p, ms) =>
+  Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error('timeout')), ms))]);
+
+// Always returns quickly (no dependencies)
+app.get('/health', (req, res) => {
+  res.json({ status: 'up', ts: new Date().toISOString() });
+});
+
+// Check only Redis (Upstash) quickly
+app.get('/health/redis', async (req, res) => {
+  try {
+    await withTimeout(redis.ping(), 800);
+    res.json({ redis: 'ok' });
+  } catch (e) {
+    res.status(503).json({ redis: 'fail', error: e.message });
+  }
+});
+
+// Check only Dynamo quickly
+app.get('/health/dynamo', async (req, res) => {
+  try {
+    await withTimeout(
+      docClient.send(new GetCommand({ TableName: TABLE_NAME, Key: { PK: 'HEALTH_CHECK', SK: 'TEST' } })),
+      1500
+    );
+    res.json({ dynamo: 'ok', table: TABLE_NAME });
+  } catch (e) {
+    res.status(503).json({ dynamo: 'fail', table: TABLE_NAME, error: e.message });
+  }
+});
+
+// Authentication
+app.post('/api/auth/token', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID required' });
+    }
+
+    // Create user if doesn't exist
+    let user = await db.getUser(userId);
+    if (!user) {
+      user = await db.createUser({
+        id: userId,
+        totalJobs: 0,
+        monthlyJobsUsed: 0,
+        monthlyJobsLimit: 100,
+        subscriptionTier: 'free',
+      });
+    }
+
+    const token = jwt.sign(
+      { id: userId, type: 'user' },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({ token, expiresIn: '7d' });
+  } catch (error) {
+    logger.error('Token generation failed:', error);
+    res.status(500).json({ error: 'Token generation failed' });
+  }
+});
+
+// Submit job
+app.post('/api/jobs', authenticateToken, userLimiter, upload.any(), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const isMultipart = req.is('multipart/form-data');
+    
+    let input = {};
+    if (isMultipart) {
+      input = req.body.input ? JSON.parse(req.body.input) : req.body;
+      
+      if (req.files && req.files.length > 0) {
+        input.files = req.files.map(file => ({
+          field: file.fieldname,
+          name: file.originalname,
+          mime: file.mimetype,
+          size: file.size,
+          base64: file.buffer.toString('base64'),
+        }));
+      }
+    } else {
+      input = req.body.input || req.body;
+    }
+
+    const { workflow, priority = 'basic' } = input;
+
+    if (!workflow) {
+      return res.status(400).json({ error: 'Workflow is required' });
+    }
+
+    // Validate workflow exists
+    if (!workflowHandlers[workflow]) {
+      return res.status(400).json({ 
+        error: `Unknown workflow: ${workflow}`, 
+        supportedWorkflows: Object.keys(workflowHandlers)
+      });
+    }
+
+    const jobId = uuidv4();
+    
+    const job = await db.createJob({
+      id: jobId,
+      userId,
+      workflow,
+      status: 'PENDING',
+      priority,
+      input,
+    });
+
+    await jobQueue.add('process-runpod-job', {
+      jobId,
+      userId,
+      input,
+    }, {
+      priority: priority === 'premium' ? 10 : 5,
+      jobId,
+    });
+
+    logger.info(`Job ${jobId} submitted for user ${userId} with workflow ${workflow}`);
+
+    res.json({
+      jobId,
+      status: 'PENDING',
+      workflow,
+      estimatedProcessingTime: '30-60 seconds'
+    });
+
+  } catch (error) {
+    logger.error('Job submission failed:', error);
+    res.status(500).json({ 
+      error: 'Job submission failed',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get job status
+app.get('/api/jobs/:jobId', authenticateToken, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.user.id;
+
+    const job = await db.getJob(jobId, userId);
+
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    let queuePosition = null;
+    if (job.status === 'PENDING') {
+      try {
+        const queueJob = await jobQueue.getJob(jobId);
+        if (queueJob) {
+          const waiting = await jobQueue.getWaiting();
+          queuePosition = waiting.findIndex(j => j.id === jobId) + 1;
+        }
+      } catch (err) {
+        logger.warn(`Could not get queue position for job ${jobId}:`, err);
+      }
+    }
+
+    res.json({
+      jobId: job.jobId,
+      status: job.status,
+      workflow: job.workflow,
+      priority: job.priority,
+      createdAt: job.createdAt,
+      processingStartedAt: job.processingStartedAt,
+      completedAt: job.completedAt,
+      queuePosition,
+      runpodJobId: job.runpodJobId,
+      result: job.status === 'COMPLETED' ? job.result : null,
+      error: job.status === 'FAILED' ? job.error : null,
+    });
+
+  } catch (error) {
+    logger.error('Job status fetch failed:', error);
+    res.status(500).json({ error: 'Failed to fetch job status' });
+  }
+});
+
+// Get job result with workflow-specific formatting
+app.get('/api/jobs/:jobId/result', authenticateToken, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.user.id;
+
+    const job = await db.getJob(jobId, userId);
+
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    if (job.status !== 'COMPLETED') {
+      return res.json({
+        ready: false,
+        status: job.status,
+        error: job.error,
+      });
+    }
+
+    const result = job.result || {};
+    let response = { 
+      ready: true, 
+      workflow: job.workflow,
+      raw: result
+    };
+
+    // Workflow-specific result formatting
+    if (job.workflow === 'API_AVATAR_WF') {
+      const outputPerNode = result.outputPerNode || {};
+      
+      response.avatarUrl = outputPerNode['132']?.[0]?.url || null;
+      response.avatarNoBgUrl = outputPerNode['133']?.[0]?.url || null;
+      
+      if (!response.avatarUrl || !response.avatarNoBgUrl) {
+        const extractUrl = (nodeId) => {
+          return outputPerNode[nodeId]?.[0]?.url || 
+                 outputPerNode[String(nodeId)]?.[0]?.url || 
+                 null;
+        };
+        
+        response.avatarUrl = response.avatarUrl || extractUrl(132);
+        response.avatarNoBgUrl = response.avatarNoBgUrl || extractUrl(133);
+      }
+    } else if (job.workflow === 'API_V7_ULTIMATE_WF' || job.workflow === 'API_CREATE_CLTH') {
+      // Add specific result formatting for other workflows as needed
+      const outputPerNode = result.outputPerNode || {};
+      response.resultUrls = [];
+      
+      Object.keys(outputPerNode).forEach(nodeId => {
+        if (outputPerNode[nodeId] && outputPerNode[nodeId].length > 0) {
+          response.resultUrls.push(...outputPerNode[nodeId].map(item => item.url).filter(Boolean));
+        }
+      });
+    }
+
+    res.json(response);
+
+  } catch (error) {
+    logger.error('Job result fetch failed:', error);
+    res.status(500).json({ error: 'Failed to fetch job result' });
+  }
+});
+
+// List user jobs
+app.get('/api/jobs', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { limit = 20 } = req.query;
+    
+    const result = await db.getUserJobs(userId, parseInt(limit));
+
+    res.json({
+      jobs: result.jobs.map(job => ({
+        jobId: job.jobId,
+        workflow: job.workflow,
+        status: job.status,
+        priority: job.priority,
+        createdAt: job.createdAt,
+        completedAt: job.completedAt,
+        error: job.error,
+      })),
+      hasMore: !!result.lastKey
+    });
+
+  } catch (error) {
+    logger.error('Jobs list fetch failed:', error);
+    res.status(500).json({ error: 'Failed to fetch jobs' });
+  }
+});
+
+// Error handling
+app.use((error, req, res, next) => {
+  logger.error('Unhandled error:', error);
+  
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File too large (max 15MB)' });
+    }
+    if (error.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({ error: 'Too many files (max 5)' });
+    }
+  }
+  
+  res.status(500).json({ 
+    error: 'Internal server error',
+    details: NODE_ENV === 'development' ? error.message : undefined
+  });
+});
+
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, shutting down gracefully...');
+  
+  try {
+    await worker.close();
+    await redis.quit();
+    process.exit(0);
+  } catch (error) {
+    logger.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+});
+
+// Start server
+const server = app.listen(PORT, () => {
+  logger.info(`Server running on port ${PORT}`, {
+    environment: NODE_ENV,
+    queueConcurrency: QUEUE_CONCURRENCY,
+    runpodBase: RUNPOD_PROXY_BASE,
+    dynamoTable: TABLE_NAME,
+    supportedWorkflows: Object.keys(workflowHandlers)
+  });
+});
+
+export default app;
