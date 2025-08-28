@@ -14,6 +14,7 @@ import fetch from "node-fetch";
 import { v4 as uuidv4 } from "uuid";
 import winston from "winston";
 import { promisify } from "util";
+import IORedis from "ioredis";
 
 // ===================== CONFIGURATION =====================
 const {
@@ -246,10 +247,16 @@ redis.on('error', (err) => logger.error('Redis Client Error', err));
 redis.on('connect', () => logger.info('Redis Client Connected'));
 
 await redis.connect();
-
+// BullMQ needs an ioredis connection (not node-redis)
+const bullConnection = new IORedis(REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+});
+bullConnection.on('error', (err) => logger.error('BullMQ Redis Error', err));
+bullConnection.on('connect', () => logger.info('BullMQ Redis Connected'));
 // Job Queue Setup
 const jobQueue = new Queue('runpod-jobs', {
-  connection: redis,
+  connection: bullConnection,
   defaultJobOptions: {
     attempts: parseInt(QUEUE_MAX_RETRIES),
     backoff: {
@@ -261,7 +268,7 @@ const jobQueue = new Queue('runpod-jobs', {
   },
 });
 
-const queueEvents = new QueueEvents('runpod-jobs', { connection: redis });
+const queueEvents = new QueueEvents('runpod-jobs', { connection: bullConnection });
 
 // Queue event handlers
 queueEvents.on('completed', async ({ jobId, returnvalue }) => {
@@ -578,7 +585,7 @@ const worker = new Worker('runpod-jobs', async (job) => {
     throw error;
   }
 }, {
-  connection: redis,
+  connection: bullConnection,
   concurrency: parseInt(QUEUE_CONCURRENCY),
 });
 
@@ -996,3 +1003,4 @@ const server = app.listen(PORT, () => {
 });
 
 export default app;
+
