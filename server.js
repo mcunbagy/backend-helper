@@ -1,4 +1,4 @@
-// server.js - DynamoDB Version for Production
+// server.js - DynamoDB Version for Production (Fixed for PK/SK structure)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -97,16 +97,23 @@ const dynamoClient = new DynamoDBClient({
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 const TABLE_NAME = DYNAMODB_TABLE_NAME || "outfitz-jobs";
 
-// Database helper functions
+// Database helper functions - Fixed for PK/SK structure
 const db = {
   async createJob(jobData) {
+    const timestamp = new Date().toISOString();
     const params = {
       TableName: TABLE_NAME,
       Item: {
-        PK: `JOB#${jobData.id}`,
-        SK: 'METADATA',
-        ...jobData,
-        createdAt: new Date().toISOString(),
+        PK: `USER#${jobData.userId}`,
+        SK: `JOB#${timestamp}#${jobData.id}`,
+        // Store all job data as attributes
+        jobId: jobData.id,
+        userId: jobData.userId,
+        workflow: jobData.workflow,
+        status: jobData.status,
+        priority: jobData.priority,
+        input: jobData.input,
+        createdAt: timestamp,
       }
     };
     await docClient.send(new PutCommand(params));
@@ -114,24 +121,34 @@ const db = {
   },
 
   async getJob(jobId, userId = null) {
+    // Since we can't directly query by jobId with this structure,
+    // we need to query all user jobs and find the specific one
+    if (!userId) {
+      throw new Error('userId is required to get job with current table structure');
+    }
+
     const params = {
       TableName: TABLE_NAME,
-      Key: {
-        PK: `JOB#${jobId}`,
-        SK: 'METADATA'
+      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)',
+      ExpressionAttributeValues: {
+        ':pk': `USER#${userId}`,
+        ':sk': 'JOB#'
       }
     };
     
-    const result = await docClient.send(new GetCommand(params));
-    if (!result.Item) return null;
+    const result = await docClient.send(new QueryCommand(params));
+    const job = result.Items?.find(item => item.jobId === jobId);
     
-    // Check if user has access to this job
-    if (userId && result.Item.userId !== userId) return null;
-    
-    return result.Item;
+    return job || null;
   },
 
-  async updateJob(jobId, updates) {
+  async updateJobWithUser(jobId, userId, updates) {
+    // First find the job to get its SK
+    const job = await this.getJob(jobId, userId);
+    if (!job) {
+      throw new Error('Job not found');
+    }
+
     const updateExpression = [];
     const expressionAttributeNames = {};
     const expressionAttributeValues = {};
@@ -148,8 +165,8 @@ const db = {
     const params = {
       TableName: TABLE_NAME,
       Key: {
-        PK: `JOB#${jobId}`,
-        SK: 'METADATA'
+        PK: job.PK,
+        SK: job.SK
       },
       UpdateExpression: `SET ${updateExpression.join(', ')}`,
       ExpressionAttributeNames: expressionAttributeNames,
@@ -162,12 +179,12 @@ const db = {
   async getUserJobs(userId, limit = 20, lastKey = null) {
     const params = {
       TableName: TABLE_NAME,
-      IndexName: 'UserJobsIndex', // You'll need to create this GSI
-      KeyConditionExpression: 'userId = :userId',
+      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)',
       ExpressionAttributeValues: {
-        ':userId': userId
+        ':pk': `USER#${userId}`,
+        ':sk': 'JOB#'
       },
-      ScanIndexForward: false, // Sort by creation date descending
+      ScanIndexForward: false, // Sort by SK descending (newest first)
       Limit: limit
     };
 
@@ -188,6 +205,7 @@ const db = {
       Item: {
         PK: `USER#${userData.id}`,
         SK: 'PROFILE',
+        userId: userData.id,
         ...userData,
         createdAt: new Date().toISOString(),
       }
@@ -242,27 +260,39 @@ const jobQueue = new Queue('runpod-jobs', {
 const queueEvents = new QueueEvents('runpod-jobs', { connection: redis });
 
 // Queue event handlers
-queueEvents.on('completed', async ({ jobId, returnvalue }) => {
+queueEvents.on('completed', async ({ jobId, returnvalue, data }) => {
   logger.info(`Job ${jobId} completed`);
   try {
-    await db.updateJob(jobId, {
-      status: 'COMPLETED',
-      result: returnvalue,
-      completedAt: new Date().toISOString(),
-    });
+    // Extract userId from job data since we need it for the update
+    const userId = data?.userId;
+    if (userId) {
+      await db.updateJobWithUser(jobId, userId, {
+        status: 'COMPLETED',
+        result: returnvalue,
+        completedAt: new Date().toISOString(),
+      });
+    } else {
+      logger.error(`No userId found for completed job ${jobId}`);
+    }
   } catch (error) {
     logger.error(`Failed to update completed job ${jobId}:`, error);
   }
 });
 
-queueEvents.on('failed', async ({ jobId, failedReason }) => {
+queueEvents.on('failed', async ({ jobId, failedReason, data }) => {
   logger.error(`Job ${jobId} failed:`, failedReason);
   try {
-    await db.updateJob(jobId, {
-      status: 'FAILED',
-      error: failedReason,
-      completedAt: new Date().toISOString(),
-    });
+    // Extract userId from job data since we need it for the update
+    const userId = data?.userId;
+    if (userId) {
+      await db.updateJobWithUser(jobId, userId, {
+        status: 'FAILED',
+        error: failedReason,
+        completedAt: new Date().toISOString(),
+      });
+    } else {
+      logger.error(`No userId found for failed job ${jobId}`);
+    }
   } catch (error) {
     logger.error(`Failed to update failed job ${jobId}:`, error);
   }
@@ -375,7 +405,7 @@ const worker = new Worker('runpod-jobs', async (job) => {
   logger.info(`Processing job ${jobId} for user ${userId}`);
   
   try {
-    await db.updateJob(jobId, { 
+    await db.updateJobWithUser(jobId, userId, { 
       status: 'PROCESSING',
       processingStartedAt: new Date().toISOString()
     });
@@ -400,7 +430,7 @@ const worker = new Worker('runpod-jobs', async (job) => {
       throw new Error('RunPod did not return job ID');
     }
 
-    await db.updateJob(jobId, { 
+    await db.updateJobWithUser(jobId, userId, { 
       runpodJobId,
       status: 'SUBMITTED_TO_RUNPOD'
     });
@@ -653,7 +683,7 @@ app.get('/api/jobs/:jobId', authenticateToken, async (req, res) => {
     }
 
     res.json({
-      jobId: job.id,
+      jobId: job.jobId,
       status: job.status,
       workflow: job.workflow,
       priority: job.priority,
@@ -717,6 +747,33 @@ app.get('/api/jobs/:jobId/result', authenticateToken, async (req, res) => {
   } catch (error) {
     logger.error('Job result fetch failed:', error);
     res.status(500).json({ error: 'Failed to fetch job result' });
+  }
+});
+
+// List user jobs
+app.get('/api/jobs', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { limit = 20 } = req.query;
+    
+    const result = await db.getUserJobs(userId, parseInt(limit));
+
+    res.json({
+      jobs: result.jobs.map(job => ({
+        jobId: job.jobId,
+        workflow: job.workflow,
+        status: job.status,
+        priority: job.priority,
+        createdAt: job.createdAt,
+        completedAt: job.completedAt,
+        error: job.error,
+      })),
+      hasMore: !!result.lastKey
+    });
+
+  } catch (error) {
+    logger.error('Jobs list fetch failed:', error);
+    res.status(500).json({ error: 'Failed to fetch jobs' });
   }
 });
 
