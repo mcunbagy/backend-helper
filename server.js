@@ -1,4 +1,4 @@
-// server.js - DynamoDB Version for Production (Fixed for PK/SK structure)
+// server.js - DynamoDB Version for Production (Flexible Workflow System)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -298,38 +298,167 @@ queueEvents.on('failed', async ({ jobId, failedReason, data }) => {
   }
 });
 
-// ===================== JOB PROCESSOR =====================
-async function buildRunpodPayload(input) {
-  const { workflow, files = [], prompt, ...otherInputs } = input;
+// ===================== WORKFLOW SYSTEM =====================
 
-  if (workflow === 'API_AVATAR_WF') {
-    // Skip file upload, use existing files on RunPod
-    return {
-      input: {
+// Workflow Registry - Handles all workflow types with flexible input sources
+const workflowHandlers = {
+  "API_AVATAR_WF": {
+    outputNodes: ["132", "133"],
+    process: async (input, userData) => {
+      // Determine gender-based pose
+      const gender = userData?.gender || input.gender || "male";
+      const poseFile = gender === "female" 
+        ? "/workspace/pose-input-woman.png" 
+        : "/workspace/pose-input-man.png";
+
+      // Handle selfie image source
+      let selfieImagePath = "/workspace/memoSelf.jpg"; // Default
+      
+      if (input.files && input.files.length > 0) {
+        // User uploaded a file
+        const selfieFile = input.files.find(f => ['selfie', 'avatar', 'photo'].includes(f.field));
+        if (selfieFile) {
+          selfieImagePath = `/workspace/comfy/ComfyUI/input/${await uploadFileToRunpod(selfieFile)}`;
+        }
+      } else if (input.selfieImagePath) {
+        // Pre-existing path provided
+        selfieImagePath = input.selfieImagePath;
+      }
+
+      return {
         workflow_path: "/workspace/OUTFITZ/01-Workflows/API_AVATAR_WF.json",
         set_nodes: {
-          "12.image_path": "/workspace/memoSelf.jpg",  // Use existing file
-          "120.image_path": "/workspace/pose-input-man.png",
-          "63.text": prompt || "",
+          "12.image_path": selfieImagePath,
+          "120.image_path": poseFile,
+          "63.text": input.prompt || userData?.stylePrompt || "Full-body portrait, professional lighting",
           "72.text": "close-up, close shot, close up shot, (worst quality, low quality, normal quality, lowres, low details, oversaturated, undersaturated, overexposed, underexposed, grayscale, bw, bad photo, bad photography, bad art:1.4), (watermark, signature, text font, username, error, logo, words, letters, digits, autograph, trademark, name:1.2), (blur, blurry, grainy), morbid, ugly, asymmetrical, mutated malformed, mutilated, poorly lit, bad shadow, draft, cropped, out of frame, cut off, censored, jpeg artifacts, out of focus, glitch, duplicate, (airbrushed, cartoon, anime, semi-realistic, cgi, render, blender, digital art, manga, amateur:1.3), (3D ,3D Game, 3D Game Scene, 3D Character:1.1), (bad hands, bad anatomy, bad body, bad face, bad teeth, bad arms, bad legs, deformities:1.3), anime, cartoon, graphic, (blur, blurry, bokeh), text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured"
-        },
-        completion_nodes: ["132", "133"],
-        complete_when_any: false
+        }
+      };
+    }
+  },
+
+  "API_V7_ULTIMATE_WF": {
+    outputNodes: ["132", "133"], // Adjust based on your workflow
+    process: async (input, userData) => {
+      const itemType = input.itemType; // "top", "bottom", or "full"
+      
+      let setNodes = {};
+      let disabledNodes = [];
+
+      // Conditional node activation based on item type
+      if (itemType === "top") {
+        setNodes = {
+          // Top-specific nodes - adjust node IDs based on your workflow
+          "10.text": input.prompt || "fashionable top, high quality",
+          "15.image_path": await handleImageInput(input, "garment", userData),
+          // Add other top-specific node configurations
+        };
+        // Disable bottom-related nodes
+        disabledNodes = ["bottom_node_1", "bottom_node_2"]; // Replace with actual node IDs
+      } else if (itemType === "bottom") {
+        setNodes = {
+          // Bottom-specific nodes
+          "20.text": input.prompt || "stylish bottom wear, high quality",
+          "25.image_path": await handleImageInput(input, "garment", userData),
+          // Add other bottom-specific node configurations
+        };
+        // Disable top-related nodes
+        disabledNodes = ["top_node_1", "top_node_2"]; // Replace with actual node IDs
+      } else if (itemType === "full") {
+        // Full outfit workflow
+        setNodes = {
+          "30.text": input.prompt || "complete outfit, fashionable, high quality",
+          "35.image_path": await handleImageInput(input, "outfit", userData),
+        };
+        // All nodes active for full outfit
+        disabledNodes = [];
       }
-    };
+
+      return {
+        workflow_path: "/workspace/OUTFITZ/01-Workflows/API_V7_ULTIMATE_WF.json",
+        set_nodes: setNodes,
+        disabled_nodes: disabledNodes // Bridge.py will need to handle this
+      };
+    }
+  },
+
+  "API_CREATE_CLTH": {
+    outputNodes: ["132", "133"], // Adjust based on your workflow
+    process: async (input, userData) => {
+      return {
+        workflow_path: "/workspace/OUTFITZ/01-Workflows/API_CREATE_CLTH.json",
+        set_nodes: {
+          // Define based on your workflow requirements
+          "40.text": input.prompt || "create clothing design, high quality",
+          "45.image_path": await handleImageInput(input, "design", userData),
+          // Add other nodes as needed
+        }
+      };
+    }
   }
+};
+
+// Helper function to handle different image input sources
+async function handleImageInput(input, imageType, userData) {
+  // Priority order: uploaded file > AWS reference > RunPod existing > default
+  
+  // 1. Check for uploaded file
+  if (input.files && input.files.length > 0) {
+    const targetFile = input.files.find(f => f.field === imageType);
+    if (targetFile) {
+      return `/workspace/comfy/ComfyUI/input/${await uploadFileToRunpod(targetFile)}`;
+    }
+  }
+
+  // 2. Check for AWS reference (implement when needed)
+  if (input.awsImageKeys && input.awsImageKeys[imageType]) {
+    // TODO: Download from S3 and upload to RunPod
+    // return await downloadAndUploadFromAWS(input.awsImageKeys[imageType]);
+  }
+
+  // 3. Check for direct path reference
+  if (input.imagePaths && input.imagePaths[imageType]) {
+    return input.imagePaths[imageType];
+  }
+
+  // 4. Use default based on image type
+  const defaults = {
+    "selfie": "/workspace/memoSelf.jpg",
+    "pose": "/workspace/pose-input-man.png",
+    "garment": "/workspace/default-garment.jpg",
+    "outfit": "/workspace/default-outfit.jpg",
+    "design": "/workspace/default-design.jpg"
+  };
+
+  return defaults[imageType] || "/workspace/default-image.jpg";
+}
+
+// Main workflow processor
+async function buildRunpodPayload(input, userId) {
+  const { workflow } = input;
+
+  // Get workflow handler
+  const handler = workflowHandlers[workflow];
+  if (!handler) {
+    throw new Error(`Unknown workflow: ${workflow}`);
+  }
+
+  // Get user data for context
+  const userData = userId ? await db.getUser(userId) : {};
+
+  // Process workflow-specific configuration
+  const workflowConfig = await handler.process(input, userData);
 
   return {
     input: {
-      workflow_path: input.workflow_path,
-      set_nodes: input.set_nodes || {},
-      completion_nodes: input.completion_nodes || ["132", "133"],
-      complete_when_any: input.complete_when_any || false,
-      ...otherInputs
+      ...workflowConfig,
+      completion_nodes: handler.outputNodes,
+      complete_when_any: false
     }
   };
 }
 
+// File upload function (unchanged but moved here for organization)
 async function uploadFileToRunpod(file) {
   const formData = new FormData();
   const buffer = Buffer.from(file.base64, 'base64');
@@ -395,7 +524,7 @@ async function pollRunpodForCompletion(runpodJobId, maxAttempts = 180) {
 const worker = new Worker('runpod-jobs', async (job) => {
   const { jobId, userId, input } = job.data;
   
-  logger.info(`Processing job ${jobId} for user ${userId}`);
+  logger.info(`Processing job ${jobId} for user ${userId} with workflow ${input.workflow}`);
   
   try {
     await db.updateJobWithUser(jobId, userId, { 
@@ -403,7 +532,9 @@ const worker = new Worker('runpod-jobs', async (job) => {
       processingStartedAt: new Date().toISOString()
     });
 
-    const runpodBody = await buildRunpodPayload(input);
+    const runpodBody = await buildRunpodPayload(input, userId);
+    
+    logger.info(`Submitting to RunPod: ${JSON.stringify(runpodBody)}`);
     
     const response = await fetch(`${RUNPOD_PROXY_BASE}${RUNPOD_PROXY_RUN_PATH}`, {
       method: 'POST',
@@ -422,6 +553,8 @@ const worker = new Worker('runpod-jobs', async (job) => {
     if (!runpodJobId) {
       throw new Error('RunPod did not return job ID');
     }
+
+    logger.info(`RunPod job submitted with ID: ${runpodJobId}`);
 
     await db.updateJobWithUser(jobId, userId, { 
       runpodJobId,
@@ -541,6 +674,7 @@ app.get('/health', async (req, res) => {
         waiting: waiting.length,
         active: active.length,
       },
+      supportedWorkflows: Object.keys(workflowHandlers)
     });
   } catch (error) {
     logger.error('Health check failed:', error);
@@ -614,6 +748,14 @@ app.post('/api/jobs', authenticateToken, userLimiter, upload.any(), async (req, 
       return res.status(400).json({ error: 'Workflow is required' });
     }
 
+    // Validate workflow exists
+    if (!workflowHandlers[workflow]) {
+      return res.status(400).json({ 
+        error: `Unknown workflow: ${workflow}`, 
+        supportedWorkflows: Object.keys(workflowHandlers)
+      });
+    }
+
     const jobId = uuidv4();
     
     const job = await db.createJob({
@@ -634,11 +776,13 @@ app.post('/api/jobs', authenticateToken, userLimiter, upload.any(), async (req, 
       jobId,
     });
 
-    logger.info(`Job ${jobId} submitted for user ${userId}`);
+    logger.info(`Job ${jobId} submitted for user ${userId} with workflow ${workflow}`);
 
     res.json({
       jobId,
       status: 'PENDING',
+      workflow,
+      estimatedProcessingTime: '30-60 seconds'
     });
 
   } catch (error) {
@@ -684,6 +828,7 @@ app.get('/api/jobs/:jobId', authenticateToken, async (req, res) => {
       processingStartedAt: job.processingStartedAt,
       completedAt: job.completedAt,
       queuePosition,
+      runpodJobId: job.runpodJobId,
       result: job.status === 'COMPLETED' ? job.result : null,
       error: job.status === 'FAILED' ? job.error : null,
     });
@@ -694,7 +839,7 @@ app.get('/api/jobs/:jobId', authenticateToken, async (req, res) => {
   }
 });
 
-// Get job result
+// Get job result with workflow-specific formatting
 app.get('/api/jobs/:jobId/result', authenticateToken, async (req, res) => {
   try {
     const { jobId } = req.params;
@@ -715,107 +860,6 @@ app.get('/api/jobs/:jobId/result', authenticateToken, async (req, res) => {
     }
 
     const result = job.result || {};
-    let response = { ready: true, raw: result };
-
-    if (job.workflow === 'API_AVATAR_WF') {
-      const outputPerNode = result.outputPerNode || {};
-      
-      response.avatarUrl = outputPerNode['132']?.[0]?.url || null;
-      response.avatarNoBgUrl = outputPerNode['133']?.[0]?.url || null;
-      
-      if (!response.avatarUrl || !response.avatarNoBgUrl) {
-        const extractUrl = (nodeId) => {
-          return outputPerNode[nodeId]?.[0]?.url || 
-                 outputPerNode[String(nodeId)]?.[0]?.url || 
-                 null;
-        };
-        
-        response.avatarUrl = response.avatarUrl || extractUrl(132);
-        response.avatarNoBgUrl = response.avatarNoBgUrl || extractUrl(133);
-      }
-    }
-
-    res.json(response);
-
-  } catch (error) {
-    logger.error('Job result fetch failed:', error);
-    res.status(500).json({ error: 'Failed to fetch job result' });
-  }
-});
-
-// List user jobs
-app.get('/api/jobs', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { limit = 20 } = req.query;
-    
-    const result = await db.getUserJobs(userId, parseInt(limit));
-
-    res.json({
-      jobs: result.jobs.map(job => ({
-        jobId: job.jobId,
-        workflow: job.workflow,
-        status: job.status,
-        priority: job.priority,
-        createdAt: job.createdAt,
-        completedAt: job.completedAt,
-        error: job.error,
-      })),
-      hasMore: !!result.lastKey
-    });
-
-  } catch (error) {
-    logger.error('Jobs list fetch failed:', error);
-    res.status(500).json({ error: 'Failed to fetch jobs' });
-  }
-});
-
-// Error handling
-app.use((error, req, res, next) => {
-  logger.error('Unhandled error:', error);
-  
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File too large (max 15MB)' });
-    }
-    if (error.code === 'LIMIT_FILE_COUNT') {
-      return res.status(400).json({ error: 'Too many files (max 5)' });
-    }
-  }
-  
-  res.status(500).json({ 
-    error: 'Internal server error',
-    details: NODE_ENV === 'development' ? error.message : undefined
-  });
-});
-
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
-});
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully...');
-  
-  try {
-    await worker.close();
-    await redis.quit();
-    process.exit(0);
-  } catch (error) {
-    logger.error('Error during shutdown:', error);
-    process.exit(1);
-  }
-});
-
-// Start server
-const server = app.listen(PORT, () => {
-  logger.info(`Server running on port ${PORT}`, {
-    environment: NODE_ENV,
-    queueConcurrency: QUEUE_CONCURRENCY,
-    runpodBase: RUNPOD_PROXY_BASE,
-    dynamoTable: TABLE_NAME,
-  });
-});
-
-export default app;
-
+    let response = { 
+      ready: true, 
+      workflow: job.workflow,
