@@ -508,7 +508,21 @@ async function pollRunpodForCompletion(runpodJobId, maxAttempts = 180) {
       const status = await response.json();
       
       logger.debug(`Job ${runpodJobId} status check ${attempt}: ${status.status}`);
-
+      
+      // Update intermediate statuses in database
+      const bridgeStatus = status.status;
+      if (bridgeStatus === 'IN_QUEUE' || bridgeStatus === 'IN_PROGRESS') {
+        try {
+          await db.updateJobWithUser(jobId, userId, { 
+            status: bridgeStatus,
+            lastUpdated: new Date().toISOString()
+          });
+          logger.info(`Job ${jobId} status updated to: ${bridgeStatus}`);
+        } catch (updateError) {
+          logger.error(`Failed to update job status: ${updateError.message}`);
+        }
+      }
+      
       if (status.status === 'COMPLETED') {
         return status.output || status;
       }
@@ -1003,4 +1017,5 @@ const server = app.listen(PORT, () => {
 });
 
 export default app;
+
 
