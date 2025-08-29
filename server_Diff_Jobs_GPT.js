@@ -492,7 +492,7 @@ async function uploadFileToRunpod(file) {
   return result.filename;
 }
 
-async function pollRunpodForCompletion(runpodJobId, maxAttempts = 180) {
+async function pollRunpodForCompletion(runpodJobId, jobId, userId, maxAttempts = 180) {
   const delay = promisify(setTimeout);
   
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -589,7 +589,7 @@ const worker = new Worker('runpod-jobs', async (job) => {
       status: 'SUBMITTED_TO_RUNPOD'
     });
 
-    const result = await pollRunpodForCompletion(runpodJobId);
+    const result = await pollRunpodForCompletion(runpodJobId, jobId, userId);
     
     logger.info(`Job ${jobId} completed successfully`);
     return result;
@@ -1017,5 +1017,6 @@ const server = app.listen(PORT, () => {
 });
 
 export default app;
+
 
 
