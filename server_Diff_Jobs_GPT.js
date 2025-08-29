@@ -110,7 +110,12 @@ const s3Client = new S3Client({
   },
 });
 
-const docClient = DynamoDBDocumentClient.from(dynamoClient);
+const docClient = DynamoDBDocumentClient.from(dynamoClient, {
+  marshallOptions: {
+    removeUndefinedValues: true,
+    convertEmptyValues: false,
+  },
+});
 const TABLE_NAME = DYNAMODB_TABLE_NAME;
 const BUCKET_NAME = S3_BUCKET_NAME;
 
@@ -1081,3 +1086,4 @@ const server = app.listen(PORT, () => {
 });
 
 export default app;
+
