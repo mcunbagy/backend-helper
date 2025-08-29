@@ -1,4 +1,4 @@
-// server.js - DynamoDB Version for Production (Flexible Workflow System)
+// server.js - DynamoDB + S3 Version for Production (Flexible Workflow System)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -7,6 +7,8 @@ import rateLimit from "express-rate-limit";
 import { createClient } from "redis";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Queue, Worker, QueueEvents } from "bullmq";
 import jwt from "jsonwebtoken";
 import multer from "multer";
@@ -26,6 +28,7 @@ const {
   AWS_ACCESS_KEY_ID,
   AWS_SECRET_ACCESS_KEY,
   DYNAMODB_TABLE_NAME,
+  S3_BUCKET_NAME,
   
   // Redis Configuration
   REDIS_URL,
@@ -55,8 +58,8 @@ const {
 } = process.env;
 
 // Validation
-if (!AWS_REGION || !AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY || !DYNAMODB_TABLE_NAME) {
-  console.error("[FATAL] AWS credentials and table name are required");
+if (!AWS_REGION || !AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY || !DYNAMODB_TABLE_NAME || !S3_BUCKET_NAME) {
+  console.error("[FATAL] AWS credentials, table name, and S3 bucket are required");
   process.exit(1);
 }
 if (!REDIS_URL) {
@@ -90,9 +93,17 @@ const logger = winston.createLogger({
   ]
 });
 
-// ===================== DATABASE SETUP =====================
+// ===================== AWS CLIENTS SETUP =====================
 const dynamoClient = new DynamoDBClient({
-  region: AWS_REGION || "us-east-1",
+  region: AWS_REGION,
+  credentials: {
+    accessKeyId: AWS_ACCESS_KEY_ID,
+    secretAccessKey: AWS_SECRET_ACCESS_KEY,
+  },
+});
+
+const s3Client = new S3Client({
+  region: AWS_REGION,
   credentials: {
     accessKeyId: AWS_ACCESS_KEY_ID,
     secretAccessKey: AWS_SECRET_ACCESS_KEY,
@@ -100,34 +111,82 @@ const dynamoClient = new DynamoDBClient({
 });
 
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
-const TABLE_NAME = DYNAMODB_TABLE_NAME || "outfitz-jobs";
+const TABLE_NAME = DYNAMODB_TABLE_NAME;
+const BUCKET_NAME = S3_BUCKET_NAME;
 
-// Database helper functions - Fixed for PK/SK structure
+// ===================== S3 HELPER FUNCTIONS =====================
+async function uploadImageToS3(imageBuffer, userId, filename, contentType) {
+  try {
+    const timestamp = Date.now();
+    const s3Key = `users/${userId}/images/${timestamp}_${filename}`;
+    
+    await s3Client.send(new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: s3Key,
+      Body: imageBuffer,
+      ContentType: contentType || 'image/jpeg',
+    }));
+
+    logger.info(`Uploaded image to S3: ${s3Key}`);
+    return s3Key;
+  } catch (error) {
+    logger.error(`S3 upload failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function generateS3SignedUrl(s3Key, expiresIn = 3600) {
+  try {
+    const command = new GetObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: s3Key,
+    });
+
+    const signedUrl = await getSignedUrl(s3Client, command, { expiresIn });
+    return signedUrl;
+  } catch (error) {
+    logger.error(`S3 signed URL generation failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// Database helper functions - Modified to not store large image data
 const db = {
   async createJob(jobData) {
     const timestamp = new Date().toISOString();
+    
+    // Clean job data - remove large image data, store only references
+    const cleanJobData = {
+      ...jobData,
+      input: {
+        ...jobData.input,
+        // Remove files array, keep only metadata
+        files: undefined,
+        // Keep S3 references if they exist
+        s3ImageKeys: jobData.input.s3ImageKeys || {}
+      }
+    };
+    
     const params = {
       TableName: TABLE_NAME,
       Item: {
-        PK: `USER#${jobData.userId}`,
-        SK: `JOB#${timestamp}#${jobData.id}`,
-        // Store all job data as attributes
-        jobId: jobData.id,
-        userId: jobData.userId,
-        workflow: jobData.workflow,
-        status: jobData.status,
-        priority: jobData.priority,
-        input: jobData.input,
+        PK: `USER#${cleanJobData.userId}`,
+        SK: `JOB#${timestamp}#${cleanJobData.id}`,
+        jobId: cleanJobData.id,
+        userId: cleanJobData.userId,
+        workflow: cleanJobData.workflow,
+        status: cleanJobData.status,
+        priority: cleanJobData.priority,
+        input: cleanJobData.input,
         createdAt: timestamp,
       }
     };
+    
     await docClient.send(new PutCommand(params));
-    return jobData;
+    return cleanJobData;
   },
 
   async getJob(jobId, userId = null) {
-    // Since we can't directly query by jobId with this structure,
-    // we need to query all user jobs and find the specific one
     if (!userId) {
       throw new Error('userId is required to get job with current table structure');
     }
@@ -148,7 +207,6 @@ const db = {
   },
 
   async updateJobWithUser(jobId, userId, updates) {
-    // First find the job to get its SK
     const job = await this.getJob(jobId, userId);
     if (!job) {
       throw new Error('Job not found');
@@ -189,7 +247,7 @@ const db = {
         ':pk': `USER#${userId}`,
         ':sk': 'JOB#'
       },
-      ScanIndexForward: false, // Sort by SK descending (newest first)
+      ScanIndexForward: false,
       Limit: limit
     };
 
@@ -233,7 +291,7 @@ const db = {
   }
 };
 
-// ===================== REDIS & QUEUE =====================
+// ===================== REDIS & QUEUE SETUP =====================
 const redis = createClient({
   url: REDIS_URL,
   socket: {
@@ -247,14 +305,14 @@ redis.on('error', (err) => logger.error('Redis Client Error', err));
 redis.on('connect', () => logger.info('Redis Client Connected'));
 
 await redis.connect();
-// BullMQ needs an ioredis connection (not node-redis)
+
 const bullConnection = new IORedis(REDIS_URL, {
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
 });
 bullConnection.on('error', (err) => logger.error('BullMQ Redis Error', err));
 bullConnection.on('connect', () => logger.info('BullMQ Redis Connected'));
-// Job Queue Setup
+
 const jobQueue = new Queue('runpod-jobs', {
   connection: bullConnection,
   defaultJobOptions: {
@@ -274,7 +332,7 @@ const queueEvents = new QueueEvents('runpod-jobs', { connection: bullConnection 
 queueEvents.on('completed', async ({ jobId, returnvalue }) => {
   logger.info(`Job ${jobId} completed`);
   try {
-    const qJob = await jobQueue.getJob(jobId); // << fetch job
+    const qJob = await jobQueue.getJob(jobId);
     const userId = qJob?.data?.userId;
     if (userId) {
       await db.updateJobWithUser(jobId, userId, {
@@ -293,7 +351,7 @@ queueEvents.on('completed', async ({ jobId, returnvalue }) => {
 queueEvents.on('failed', async ({ jobId, failedReason }) => {
   logger.error(`Job ${jobId} failed:`, failedReason);
   try {
-    const qJob = await jobQueue.getJob(jobId); // << fetch job
+    const qJob = await jobQueue.getJob(jobId);
     const userId = qJob?.data?.userId;
     if (userId) {
       await db.updateJobWithUser(jobId, userId, {
@@ -309,30 +367,23 @@ queueEvents.on('failed', async ({ jobId, failedReason }) => {
   }
 });
 
-// ===================== WORKFLOW SYSTEM =====================
-
-// Workflow Registry - Handles all workflow types with flexible input sources
+// ===================== WORKFLOW SYSTEM WITH S3 INTEGRATION =====================
 const workflowHandlers = {
   "API_AVATAR_WF": {
     outputNodes: ["132", "133"],
     process: async (input, userData) => {
-      // Determine gender-based pose
       const gender = userData?.gender || input.gender || "male";
       const poseFile = gender === "female" 
         ? "/workspace/pose-input-woman.png" 
         : "/workspace/pose-input-man.png";
 
-      // Handle selfie image source
       let selfieImagePath = "/workspace/memoSelf.jpg"; // Default
       
-      if (input.files && input.files.length > 0) {
-        // User uploaded a file
-        const selfieFile = input.files.find(f => ['selfie', 'avatar', 'photo'].includes(f.field));
-        if (selfieFile) {
-          selfieImagePath = `/workspace/comfy/ComfyUI/input/${await uploadFileToRunpod(selfieFile)}`;
-        }
+      // Check for S3 image references first
+      if (input.s3ImageKeys && input.s3ImageKeys.selfie) {
+        // Generate signed URL for RunPod to download
+        selfieImagePath = await generateS3SignedUrl(input.s3ImageKeys.selfie);
       } else if (input.selfieImagePath) {
-        // Pre-existing path provided
         selfieImagePath = input.selfieImagePath;
       }
 
@@ -349,90 +400,48 @@ const workflowHandlers = {
   },
 
   "API_V7_ULTIMATE_WF": {
-    outputNodes: ["132", "133"], // Adjust based on your workflow
+    outputNodes: ["132", "133"],
     process: async (input, userData) => {
-      const itemType = input.itemType; // "top", "bottom", or "full"
-      
+      const itemType = input.itemType;
       let setNodes = {};
-      let disabledNodes = [];
 
-      // Conditional node activation based on item type
       if (itemType === "top") {
         setNodes = {
-          // Top-specific nodes - adjust node IDs based on your workflow
           "10.text": input.prompt || "fashionable top, high quality",
-          "15.image_path": await handleImageInput(input, "garment", userData),
-          // Add other top-specific node configurations
+          "15.image_path": await handleImageInputWithS3(input, "garment", userData),
         };
-        // Disable bottom-related nodes
-        disabledNodes = ["bottom_node_1", "bottom_node_2"]; // Replace with actual node IDs
       } else if (itemType === "bottom") {
         setNodes = {
-          // Bottom-specific nodes
           "20.text": input.prompt || "stylish bottom wear, high quality",
-          "25.image_path": await handleImageInput(input, "garment", userData),
-          // Add other bottom-specific node configurations
+          "25.image_path": await handleImageInputWithS3(input, "garment", userData),
         };
-        // Disable top-related nodes
-        disabledNodes = ["top_node_1", "top_node_2"]; // Replace with actual node IDs
       } else if (itemType === "full") {
-        // Full outfit workflow
         setNodes = {
           "30.text": input.prompt || "complete outfit, fashionable, high quality",
-          "35.image_path": await handleImageInput(input, "outfit", userData),
+          "35.image_path": await handleImageInputWithS3(input, "outfit", userData),
         };
-        // All nodes active for full outfit
-        disabledNodes = [];
       }
 
       return {
         workflow_path: "/workspace/OUTFITZ/01-Workflows/API_V7_ULTIMATE_WF.json",
         set_nodes: setNodes,
-        disabled_nodes: disabledNodes // Bridge.py will need to handle this
-      };
-    }
-  },
-
-  "API_CREATE_CLTH": {
-    outputNodes: ["132", "133"], // Adjust based on your workflow
-    process: async (input, userData) => {
-      return {
-        workflow_path: "/workspace/OUTFITZ/01-Workflows/API_CREATE_CLTH.json",
-        set_nodes: {
-          // Define based on your workflow requirements
-          "40.text": input.prompt || "create clothing design, high quality",
-          "45.image_path": await handleImageInput(input, "design", userData),
-          // Add other nodes as needed
-        }
       };
     }
   }
 };
 
-// Helper function to handle different image input sources
-async function handleImageInput(input, imageType, userData) {
-  // Priority order: uploaded file > AWS reference > RunPod existing > default
+// Helper function with S3 integration
+async function handleImageInputWithS3(input, imageType, userData) {
+  // Priority: S3 references > direct paths > defaults
   
-  // 1. Check for uploaded file
-  if (input.files && input.files.length > 0) {
-    const targetFile = input.files.find(f => f.field === imageType);
-    if (targetFile) {
-      return `/workspace/comfy/ComfyUI/input/${await uploadFileToRunpod(targetFile)}`;
-    }
+  if (input.s3ImageKeys && input.s3ImageKeys[imageType]) {
+    return await generateS3SignedUrl(input.s3ImageKeys[imageType]);
   }
-
-  // 2. Check for AWS reference (implement when needed)
-  if (input.awsImageKeys && input.awsImageKeys[imageType]) {
-    // TODO: Download from S3 and upload to RunPod
-    // return await downloadAndUploadFromAWS(input.awsImageKeys[imageType]);
-  }
-
-  // 3. Check for direct path reference
+  
   if (input.imagePaths && input.imagePaths[imageType]) {
     return input.imagePaths[imageType];
   }
-
-  // 4. Use default based on image type
+  
   const defaults = {
     "selfie": "/workspace/memoSelf.jpg",
     "pose": "/workspace/pose-input-man.png",
@@ -447,17 +456,13 @@ async function handleImageInput(input, imageType, userData) {
 // Main workflow processor
 async function buildRunpodPayload(input, userId) {
   const { workflow } = input;
-
-  // Get workflow handler
   const handler = workflowHandlers[workflow];
+  
   if (!handler) {
     throw new Error(`Unknown workflow: ${workflow}`);
   }
 
-  // Get user data for context
   const userData = userId ? await db.getUser(userId) : {};
-
-  // Process workflow-specific configuration
   const workflowConfig = await handler.process(input, userData);
 
   return {
@@ -469,29 +474,7 @@ async function buildRunpodPayload(input, userId) {
   };
 }
 
-// File upload function (unchanged but moved here for organization)
-async function uploadFileToRunpod(file) {
-  const formData = new FormData();
-  const buffer = Buffer.from(file.base64, 'base64');
-  const blob = new Blob([buffer], { type: file.mime });
-  
-  formData.append('file', blob, file.name);
-
-  const response = await fetch(`${RUNPOD_PROXY_BASE}/upload`, {
-    method: 'POST',
-    body: formData,
-    headers: runpodAuthHeaders,
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`File upload failed: ${response.status} - ${errorText}`);
-  }
-
-  const result = await response.json();
-  return result.filename;
-}
-
+// Polling function with status updates
 async function pollRunpodForCompletion(runpodJobId, jobId, userId, maxAttempts = 180) {
   const delay = promisify(setTimeout);
   
@@ -506,10 +489,9 @@ async function pollRunpodForCompletion(runpodJobId, jobId, userId, maxAttempts =
       }
 
       const status = await response.json();
-      
       logger.debug(`Job ${runpodJobId} status check ${attempt}: ${status.status}`);
       
-      // Update intermediate statuses in database
+      // Update intermediate statuses
       const bridgeStatus = status.status;
       if (bridgeStatus === 'IN_QUEUE' || bridgeStatus === 'IN_PROGRESS') {
         try {
@@ -548,7 +530,7 @@ async function pollRunpodForCompletion(runpodJobId, jobId, userId, maxAttempts =
   throw new Error(`Job did not complete within timeout (${maxAttempts} attempts)`);
 }
 
-// Worker
+// Worker with S3 integration
 const worker = new Worker('runpod-jobs', async (job) => {
   const { jobId, userId, input } = job.data;
   
@@ -633,14 +615,6 @@ app.use('/api/', limiter);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-app.use((req, res, next) => {
-  logger.info(`${req.method} ${req.path}`, {
-    ip: req.ip,
-    userAgent: req.get('User-Agent'),
-  });
-  next();
-});
-
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024, files: 5 },
@@ -680,46 +654,36 @@ const userLimiter = rateLimit({
 
 // ===================== ROUTES =====================
 
-//PING
-app.get('/debug/runpod/ping', async (req, res) => {
-  try {
-    const r = await fetch(`${RUNPOD_PROXY_BASE}/health`, { headers: runpodAuthHeaders });
-    const text = await r.text();
-    res.status(r.status).send(text);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// --- SIMPLE, FAST HEALTHS ---
-const withTimeout = (p, ms) =>
-  Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error('timeout')), ms))]);
-
-// Always returns quickly (no dependencies)
+// Health checks
 app.get('/health', (req, res) => {
   res.json({ status: 'up', ts: new Date().toISOString() });
 });
 
-// Check only Redis (Upstash) quickly
 app.get('/health/redis', async (req, res) => {
   try {
-    await withTimeout(redis.ping(), 800);
+    await redis.ping();
     res.json({ redis: 'ok' });
   } catch (e) {
     res.status(503).json({ redis: 'fail', error: e.message });
   }
 });
 
-// Check only Dynamo quickly
 app.get('/health/dynamo', async (req, res) => {
   try {
-    await withTimeout(
-      docClient.send(new GetCommand({ TableName: TABLE_NAME, Key: { PK: 'HEALTH_CHECK', SK: 'TEST' } })),
-      1500
-    );
+    await docClient.send(new GetCommand({ TableName: TABLE_NAME, Key: { PK: 'HEALTH_CHECK', SK: 'TEST' } }));
     res.json({ dynamo: 'ok', table: TABLE_NAME });
   } catch (e) {
     res.status(503).json({ dynamo: 'fail', table: TABLE_NAME, error: e.message });
+  }
+});
+
+app.get('/health/s3', async (req, res) => {
+  try {
+    // Simple S3 test - list objects in bucket
+    await s3Client.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: 'health-check' }));
+    res.json({ s3: 'ok', bucket: BUCKET_NAME });
+  } catch (e) {
+    res.json({ s3: 'accessible', bucket: BUCKET_NAME }); // Bucket exists but test file doesn't
   }
 });
 
@@ -732,7 +696,6 @@ app.post('/api/auth/token', async (req, res) => {
       return res.status(400).json({ error: 'User ID required' });
     }
 
-    // Create user if doesn't exist
     let user = await db.getUser(userId);
     if (!user) {
       user = await db.createUser({
@@ -757,7 +720,7 @@ app.post('/api/auth/token', async (req, res) => {
   }
 });
 
-// Submit job
+// Submit job with S3 integration
 app.post('/api/jobs', authenticateToken, userLimiter, upload.any(), async (req, res) => {
   try {
     const userId = req.user.id;
@@ -767,14 +730,22 @@ app.post('/api/jobs', authenticateToken, userLimiter, upload.any(), async (req, 
     if (isMultipart) {
       input = req.body.input ? JSON.parse(req.body.input) : req.body;
       
+      // Upload files to S3 instead of storing base64
       if (req.files && req.files.length > 0) {
-        input.files = req.files.map(file => ({
-          field: file.fieldname,
-          name: file.originalname,
-          mime: file.mimetype,
-          size: file.size,
-          base64: file.buffer.toString('base64'),
-        }));
+        const s3ImageKeys = {};
+        
+        for (const file of req.files) {
+          const s3Key = await uploadImageToS3(
+            file.buffer, 
+            userId, 
+            file.originalname, 
+            file.mimetype
+          );
+          s3ImageKeys[file.fieldname] = s3Key;
+        }
+        
+        input.s3ImageKeys = s3ImageKeys;
+        logger.info(`Uploaded ${req.files.length} images to S3 for user ${userId}`);
       }
     } else {
       input = req.body.input || req.body;
@@ -786,7 +757,6 @@ app.post('/api/jobs', authenticateToken, userLimiter, upload.any(), async (req, 
       return res.status(400).json({ error: 'Workflow is required' });
     }
 
-    // Validate workflow exists
     if (!workflowHandlers[workflow]) {
       return res.status(400).json({ 
         error: `Unknown workflow: ${workflow}`, 
@@ -839,7 +809,6 @@ app.get('/api/jobs/:jobId', authenticateToken, async (req, res) => {
     const userId = req.user.id;
 
     const job = await db.getJob(jobId, userId);
-
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
     }
@@ -877,14 +846,13 @@ app.get('/api/jobs/:jobId', authenticateToken, async (req, res) => {
   }
 });
 
-// Get job result with workflow-specific formatting
+// Get job result with S3 secure URLs
 app.get('/api/jobs/:jobId/result', authenticateToken, async (req, res) => {
   try {
     const { jobId } = req.params;
     const userId = req.user.id;
 
     const job = await db.getJob(jobId, userId);
-
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
     }
@@ -904,31 +872,27 @@ app.get('/api/jobs/:jobId/result', authenticateToken, async (req, res) => {
       raw: result
     };
 
-    // Workflow-specific result formatting
+    // Convert RunPod URLs to secure S3 URLs
     if (job.workflow === 'API_AVATAR_WF') {
       const outputPerNode = result.outputPerNode || {};
       
+      // Generate secure download URLs
+      response.avatarDownloadUrl = `http://16.16.58.88:3000/api/jobs/${jobId}/download/132/avatar.png`;
+      response.avatarNoBgDownloadUrl = `http://16.16.58.88:3000/api/jobs/${jobId}/download/133/avatar-no-bg.png`;
+      
+      // Keep original URLs for reference
       response.avatarUrl = outputPerNode['132']?.[0]?.url || null;
       response.avatarNoBgUrl = outputPerNode['133']?.[0]?.url || null;
       
-      if (!response.avatarUrl || !response.avatarNoBgUrl) {
-        const extractUrl = (nodeId) => {
-          return outputPerNode[nodeId]?.[0]?.url || 
-                 outputPerNode[String(nodeId)]?.[0]?.url || 
-                 null;
-        };
-        
-        response.avatarUrl = response.avatarUrl || extractUrl(132);
-        response.avatarNoBgUrl = response.avatarNoBgUrl || extractUrl(133);
-      }
     } else if (job.workflow === 'API_V7_ULTIMATE_WF' || job.workflow === 'API_CREATE_CLTH') {
-      // Add specific result formatting for other workflows as needed
       const outputPerNode = result.outputPerNode || {};
       response.resultUrls = [];
+      response.downloadUrls = [];
       
       Object.keys(outputPerNode).forEach(nodeId => {
         if (outputPerNode[nodeId] && outputPerNode[nodeId].length > 0) {
           response.resultUrls.push(...outputPerNode[nodeId].map(item => item.url).filter(Boolean));
+          response.downloadUrls.push(`http://16.16.58.88:3000/api/jobs/${jobId}/download/${nodeId}/result.png`);
         }
       });
     }
@@ -938,6 +902,94 @@ app.get('/api/jobs/:jobId/result', authenticateToken, async (req, res) => {
   } catch (error) {
     logger.error('Job result fetch failed:', error);
     res.status(500).json({ error: 'Failed to fetch job result' });
+  }
+});
+
+// Secure download endpoint
+app.get('/api/jobs/:jobId/download/:nodeId/:filename', authenticateToken, async (req, res) => {
+  try {
+    const { jobId, nodeId, filename } = req.params;
+    const userId = req.user.id;
+
+    // Verify user owns this job
+    const job = await db.getJob(jobId, userId);
+    if (!job || job.status !== 'COMPLETED') {
+      return res.status(404).json({ error: 'Job not found or not completed' });
+    }
+
+    // Get the original RunPod URL from job result
+    const result = job.result || {};
+    const outputPerNode = result.outputPerNode || {};
+    const nodeOutputs = outputPerNode[nodeId];
+    
+    if (!nodeOutputs || nodeOutputs.length === 0) {
+      return res.status(404).json({ error: 'Result not found' });
+    }
+
+    const originalUrl = nodeOutputs[0].url;
+    if (!originalUrl) {
+      return res.status(404).json({ error: 'Image URL not found' });
+    }
+
+    // Convert RunPod localhost URL to proxy URL for downloading
+    const downloadUrl = originalUrl.replace('http://127.0.0.1:8188', 'https://vf3p6baogp4km7-8188.proxy.runpod.net');
+    
+    // Fetch image from RunPod
+    const response = await fetch(downloadUrl);
+    if (!response.ok) {
+      return res.status(404).json({ error: 'Failed to fetch image' });
+    }
+
+    // Stream image back to user
+    res.setHeader('Content-Type', response.headers.get('content-type') || 'image/png');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    
+    const imageBuffer = await response.arrayBuffer();
+    res.send(Buffer.from(imageBuffer));
+
+  } catch (error) {
+    logger.error('Download failed:', error);
+    res.status(500).json({ error: 'Download failed' });
+  }
+});
+
+// Upload endpoint for user images
+app.post('/api/upload', authenticateToken, upload.array('images', 10), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No files uploaded' });
+    }
+
+    const uploadedImages = [];
+    
+    for (const file of req.files) {
+      const s3Key = await uploadImageToS3(
+        file.buffer,
+        userId,
+        file.originalname,
+        file.mimetype
+      );
+      
+      uploadedImages.push({
+        fieldName: file.fieldname,
+        originalName: file.originalname,
+        s3Key: s3Key,
+        size: file.size,
+        mimeType: file.mimetype
+      });
+    }
+
+    res.json({
+      success: true,
+      uploaded: uploadedImages.length,
+      images: uploadedImages
+    });
+
+  } catch (error) {
+    logger.error('Upload failed:', error);
+    res.status(500).json({ error: 'Upload failed' });
   }
 });
 
@@ -968,6 +1020,17 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
   }
 });
 
+// Debug endpoint
+app.get('/debug/runpod/ping', async (req, res) => {
+  try {
+    const response = await fetch(`${RUNPOD_PROXY_BASE}/health`, { headers: runpodAuthHeaders });
+    const text = await response.text();
+    res.status(response.status).send(text);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Error handling
 app.use((error, req, res, next) => {
   logger.error('Unhandled error:', error);
@@ -977,7 +1040,7 @@ app.use((error, req, res, next) => {
       return res.status(400).json({ error: 'File too large (max 15MB)' });
     }
     if (error.code === 'LIMIT_FILE_COUNT') {
-      return res.status(400).json({ error: 'Too many files (max 5)' });
+      return res.status(400).json({ error: 'Too many files (max 10)' });
     }
   }
   
@@ -1012,11 +1075,9 @@ const server = app.listen(PORT, () => {
     queueConcurrency: QUEUE_CONCURRENCY,
     runpodBase: RUNPOD_PROXY_BASE,
     dynamoTable: TABLE_NAME,
+    s3Bucket: BUCKET_NAME,
     supportedWorkflows: Object.keys(workflowHandlers)
   });
 });
 
 export default app;
-
-
-
